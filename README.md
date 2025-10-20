@@ -158,6 +158,13 @@ Refer to [FastReID](https://github.com/JDAI-CV/fast-reid)  repository for additi
 ## Tracking
 
 By submitting the txt files produced in this part to [MOTChallenge](https://motchallenge.net/) website and you can get the same results as in the paper.<br>
+
+### Conditional ReID usage (real-time optimization)
+
+- `tracker/bot_sort.py` now defers FastReID inference until the tracker detects ambiguous associations (close IoU costs, overlapping detections, or conflicting assignments). This preserves the original IoU-first behaviour and only spends appearance compute when ID switches are likely.
+- When ambiguity is detected, only the involved detections are encoded and fused with the motion cost; all other matches remain IoU-driven.
+- Tracks that remain featureless after confirmation automatically queue a one-off appearance capture once they have been stable for `reid_min_track_age` frames (default 3), so future conflicts can still benefit from ReID.
+- Optional CLI knobs (fallback defaults shown) allow fine tuning: `reid_ambiguity_thresh=0.1`, `reid_overlap_thresh=0.4`, `reid_min_track_age=3`.
 Tuning the tracking parameters carefully could lead to higher performance. In the paper we apply ByteTrack's calibration.
 
 * **Test on MOT17**
@@ -259,7 +266,6 @@ A large part of the codes, ideas and results are borrowed from
 [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) and
 [YOLOv7](https://github.com/wongkinyiu/yolov7). 
 Thanks for their excellent work!
-
 
 
 

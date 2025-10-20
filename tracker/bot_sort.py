@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import deque
 
+from loguru import logger
+
 from tracker import matching
 from tracker.gmc import GMC
 from tracker.basetrack import BaseTrack, TrackState
@@ -226,6 +228,9 @@ class BoTSORT(object):
             self.encoder = FastReIDInterface(args.fast_reid_config, args.fast_reid_weights, args.device)
 
         self.gmc = GMC(method=args.cmc_method, verbose=[args.name, args.ablation])
+        self.reid_ambiguity_thresh = getattr(args, 'reid_ambiguity_thresh', 0.1)
+        self.reid_overlap_thresh = getattr(args, 'reid_overlap_thresh', 0.4)
+        self.reid_min_track_age = getattr(args, 'reid_min_track_age', 3)
 
     def update(self, output_results, img):
         self.frame_id += 1
@@ -233,6 +238,7 @@ class BoTSORT(object):
         refind_stracks = []
         lost_stracks = []
         removed_stracks = []
+        pending_init_features = {}
 
         if len(output_results):
             if output_results.shape[1] == 5:
@@ -264,18 +270,10 @@ class BoTSORT(object):
             scores_keep = []
             classes_keep = []
 
-        '''Extract embeddings '''
-        if self.args.with_reid:
-            features_keep = self.encoder.inference(img, dets)
-
         if len(dets) > 0:
             '''Detections'''
-            if self.args.with_reid:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, f) for
-                              (tlbr, s, f) in zip(dets, scores_keep, features_keep)]
-            else:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                              (tlbr, s) in zip(dets, scores_keep)]
+            detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
+                          (tlbr, s) in zip(dets, scores_keep)]
         else:
             detections = []
 
@@ -301,13 +299,28 @@ class BoTSORT(object):
 
         # Associate with high score detection boxes
         ious_dists = matching.iou_distance(strack_pool, detections)
+        raw_ious_dists = ious_dists.copy()
         ious_dists_mask = (ious_dists > self.proximity_thresh)
+
+        if self.args.with_reid:
+            reid_det_indices, reid_track_indices = self._select_reid_candidates(raw_ious_dists, strack_pool, detections)
+            if reid_det_indices:
+                self._extract_reid_features(
+                    img,
+                    detections,
+                    reid_det_indices,
+                    self.frame_id,
+                    stage="high-score",
+                    raw_boxes=dets,
+                    track_indices=reid_track_indices,
+                    tracks=strack_pool
+                )
 
         if not self.args.mot20:
             ious_dists = matching.fuse_score(ious_dists, detections)
 
         if self.args.with_reid:
-            emb_dists = matching.embedding_distance(strack_pool, detections) / 2.0
+            emb_dists = self._compute_partial_embedding_distance(strack_pool, detections) / 2.0
             raw_emb_dists = emb_dists.copy()
             emb_dists[emb_dists > self.appearance_thresh] = 1.0
             emb_dists[ious_dists_mask] = 1.0
@@ -335,6 +348,8 @@ class BoTSORT(object):
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
+            if self.args.with_reid and det.curr_feat is None and self._track_ready_for_init(track):
+                pending_init_features[track.track_id] = (track, np.array(det.tlbr, dtype=np.float32))
 
         ''' Step 3: Second association, with low score detection boxes'''
         if len(scores):
@@ -369,6 +384,8 @@ class BoTSORT(object):
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
+            if self.args.with_reid and getattr(det, 'curr_feat', None) is None and self._track_ready_for_init(track):
+                pending_init_features[track.track_id] = (track, np.array(det.tlbr, dtype=np.float32))
 
         for it in u_track:
             track = r_tracked_stracks[it]
@@ -379,12 +396,24 @@ class BoTSORT(object):
         '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
         detections = [detections[i] for i in u_detection]
         ious_dists = matching.iou_distance(unconfirmed, detections)
+        raw_ious_unconfirmed = ious_dists.copy()
         ious_dists_mask = (ious_dists > self.proximity_thresh)
         if not self.args.mot20:
             ious_dists = matching.fuse_score(ious_dists, detections)
 
         if self.args.with_reid:
-            emb_dists = matching.embedding_distance(unconfirmed, detections) / 2.0
+            reid_det_indices, reid_track_indices = self._select_reid_candidates(raw_ious_unconfirmed, unconfirmed, detections)
+            if reid_det_indices:
+                self._extract_reid_features(
+                    img,
+                    detections,
+                    reid_det_indices,
+                    self.frame_id,
+                    stage="unconfirmed",
+                    track_indices=reid_track_indices,
+                    tracks=unconfirmed
+                )
+            emb_dists = self._compute_partial_embedding_distance(unconfirmed, detections) / 2.0
             raw_emb_dists = emb_dists.copy()
             emb_dists[emb_dists > self.appearance_thresh] = 1.0
             emb_dists[ious_dists_mask] = 1.0
@@ -396,6 +425,8 @@ class BoTSORT(object):
         for itracked, idet in matches:
             unconfirmed[itracked].update(detections[idet], self.frame_id)
             activated_starcks.append(unconfirmed[itracked])
+            if self.args.with_reid and detections[idet].curr_feat is None and self._track_ready_for_init(unconfirmed[itracked]):
+                pending_init_features[unconfirmed[itracked].track_id] = (unconfirmed[itracked], np.array(detections[idet].tlbr, dtype=np.float32))
         for it in u_unconfirmed:
             track = unconfirmed[it]
             track.mark_removed()
@@ -426,11 +457,129 @@ class BoTSORT(object):
         self.removed_stracks.extend(removed_stracks)
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
 
+        if self.args.with_reid:
+            self._process_pending_initial_features(img, pending_init_features, self.frame_id)
+
         # output_stracks = [track for track in self.tracked_stracks if track.is_activated]
         output_stracks = [track for track in self.tracked_stracks]
 
 
         return output_stracks
+
+    def _select_reid_candidates(self, cost_matrix, tracks, detections):
+        if cost_matrix.size == 0 or len(tracks) == 0 or len(detections) == 0:
+            return [], []
+
+        ambiguous_tracks = set()
+        ambiguous_dets = set()
+        cost_matrix = np.asarray(cost_matrix)
+
+        # Track-driven ambiguity (multiple close detections)
+        for track_idx, row in enumerate(cost_matrix):
+            finite_mask = np.isfinite(row)
+            valid_row = row[finite_mask]
+            if valid_row.size < 2:
+                continue
+            order = np.argsort(valid_row)
+            best = valid_row[order[0]]
+            second = valid_row[order[1]]
+            if second - best < self.reid_ambiguity_thresh:
+                ambiguous_tracks.add(track_idx)
+                candidate_indices = np.where(finite_mask)[0][order[:2]]
+                ambiguous_dets.update(candidate_indices.tolist())
+
+        # Detection-driven ambiguity and high overlap
+        for det_idx, col in enumerate(cost_matrix.T):
+            finite_mask = np.isfinite(col)
+            valid_col = col[finite_mask]
+            if valid_col.size >= 2:
+                order = np.argsort(valid_col)
+                best = valid_col[order[0]]
+                second = valid_col[order[1]]
+                if second - best < self.reid_ambiguity_thresh:
+                    ambiguous_dets.add(det_idx)
+                    candidate_tracks = np.where(finite_mask)[0][order[:2]]
+                    ambiguous_tracks.update(candidate_tracks.tolist())
+
+            iou_vals = 1.0 - col
+            close_tracks = np.where(iou_vals > self.reid_overlap_thresh)[0]
+            if close_tracks.size >= 2:
+                ambiguous_dets.add(det_idx)
+                ambiguous_tracks.update(close_tracks.tolist())
+
+        return sorted(ambiguous_dets), sorted(ambiguous_tracks)
+
+    def _extract_reid_features(self, img, detections, det_indices, frame_id, stage, raw_boxes=None, track_indices=None, tracks=None):
+        if not det_indices:
+            return
+        if img is None or self.encoder is None:
+            return
+
+        unique_indices = sorted(set(det_indices))
+        if raw_boxes is not None:
+            boxes = np.asarray([raw_boxes[i] for i in unique_indices], dtype=np.float32)
+        else:
+            boxes = np.asarray([detections[i].tlbr for i in unique_indices], dtype=np.float32)
+        if boxes.size == 0:
+            return
+
+        associated_tracks = []
+        if track_indices is not None and tracks is not None:
+            associated_tracks = [tracks[idx].track_id for idx in track_indices if idx < len(tracks)]
+
+        logger.info(
+            "Frame {}: ReID triggered at '{}' stage for detections {} (boxes {}). Tracks involved: {}",
+            frame_id,
+            stage,
+            unique_indices,
+            boxes.tolist(),
+            associated_tracks if associated_tracks else "N/A"
+        )
+
+        feats = self.encoder.inference(img, boxes)
+        for idx, feat in zip(unique_indices, feats):
+            detections[idx].update_features(feat)
+
+    @staticmethod
+    def _compute_partial_embedding_distance(tracks, detections):
+        if len(tracks) == 0 or len(detections) == 0:
+            return np.zeros((len(tracks), len(detections)), dtype=np.float32)
+
+        track_indices = [idx for idx, track in enumerate(tracks) if track.smooth_feat is not None]
+        det_indices = [idx for idx, det in enumerate(detections) if det.curr_feat is not None]
+
+        emb_dists = np.ones((len(tracks), len(detections)), dtype=np.float32)
+        if not track_indices or not det_indices:
+            return emb_dists
+
+        track_subset = [tracks[idx] for idx in track_indices]
+        det_subset = [detections[idx] for idx in det_indices]
+        sub_cost = matching.embedding_distance(track_subset, det_subset)
+
+        for row_idx, track_idx in enumerate(track_indices):
+            for col_idx, det_idx in enumerate(det_indices):
+                emb_dists[track_idx, det_idx] = sub_cost[row_idx, col_idx]
+        return emb_dists
+
+    def _track_ready_for_init(self, track):
+        track_age = (track.frame_id - track.start_frame + 1) if track.start_frame is not None else 0
+        return track_age >= self.reid_min_track_age and track.smooth_feat is None
+
+    def _process_pending_initial_features(self, img, pending_features, frame_id):
+        if not pending_features or self.encoder is None:
+            return
+        boxes = np.asarray([item[1] for item in pending_features.values()], dtype=np.float32)
+        if boxes.size == 0:
+            return
+        track_ids = [item[0].track_id for item in pending_features.values()]
+        logger.info(
+            "Frame {}: Capturing initial ReID features for confirmed tracks {}",
+            frame_id,
+            track_ids
+        )
+        feats = self.encoder.inference(img, boxes)
+        for (track, _), feat in zip(pending_features.values(), feats):
+            track.update_features(feat)
 
 
 def joint_stracks(tlista, tlistb):
