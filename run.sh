@@ -13,4 +13,4 @@ docker run -it -d \
   "botsort_python3.7_image"
 
 
-# python3 tools/demo.py video --path /app/main/BoT-SORT/assets/test16.mp4 -f yolox/exps/example/mot/yolox_x_mix_det.py -c pretrained/bytetrack_x_mot17.pth.tar --with-reid --fuse-score --fp16 --fuse --save_result
+# python3 tools/demo.py video --path assets/test16.mp4 -f yolox/exps/example/mot/yolox_x_mix_det.py -c pretrained/bytetrack_x_mot17.pth.tar --with-reid --fuse-score --fp16 --fuse --save_result
