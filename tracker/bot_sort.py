@@ -23,6 +23,9 @@ class STrack(BaseTrack):
         self.kalman_filter = None
         self.mean, self.covariance = None, None
         self.is_activated = False
+        self.has_assigned_id = False
+        self.internal_id = None
+        self.track_id = -1
 
         self.score = score
         self.tracklet_len = 0
@@ -87,14 +90,15 @@ class STrack(BaseTrack):
     def activate(self, kalman_filter, frame_id):
         """Start a new tracklet"""
         self.kalman_filter = kalman_filter
-        self.track_id = self.next_id()
+        self.internal_id = self.next_id()
+        self.track_id = -1
+        self.has_assigned_id = False
 
         self.mean, self.covariance = self.kalman_filter.initiate(self.tlwh_to_xywh(self._tlwh))
 
         self.tracklet_len = 0
         self.state = TrackState.Tracked
-        if frame_id == 1:
-            self.is_activated = True
+        self.is_activated = False
         self.frame_id = frame_id
         self.start_frame = frame_id
 
@@ -105,10 +109,12 @@ class STrack(BaseTrack):
             self.update_features(new_track.curr_feat)
         self.tracklet_len = 0
         self.state = TrackState.Tracked
-        self.is_activated = True
-        self.frame_id = frame_id
         if new_id:
-            self.track_id = self.next_id()
+            self.internal_id = self.next_id()
+            self.track_id = -1
+            self.has_assigned_id = False
+        self.is_activated = self.has_assigned_id
+        self.frame_id = frame_id
         self.score = new_track.score
 
     def update(self, new_track, frame_id):
@@ -130,9 +136,17 @@ class STrack(BaseTrack):
             self.update_features(new_track.curr_feat)
 
         self.state = TrackState.Tracked
-        self.is_activated = True
+        self.is_activated = self.has_assigned_id
 
         self.score = new_track.score
+
+    def assign_identity(self):
+        """Assign a persistent identity once the track is confirmed."""
+        if self.internal_id is None:
+            self.internal_id = self.next_id()
+        self.track_id = self.internal_id
+        self.has_assigned_id = True
+        self.is_activated = True
 
     @property
     def tlwh(self):
@@ -354,8 +368,10 @@ class BoTSORT(object):
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
+            self._attempt_appearance_recovery(track)
+            self._maybe_confirm_track(track)
             if self.args.with_reid and det.curr_feat is None and self._track_ready_for_init(track):
-                pending_init_features[track.track_id] = (track, np.array(det.tlbr, dtype=np.float32))
+                pending_init_features[track.internal_id] = (track, np.array(det.tlbr, dtype=np.float32))
 
         ''' Step 3: Second association, with low score detection boxes'''
         if len(scores):
@@ -390,8 +406,10 @@ class BoTSORT(object):
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
+            self._attempt_appearance_recovery(track)
+            self._maybe_confirm_track(track)
             if self.args.with_reid and getattr(det, 'curr_feat', None) is None and self._track_ready_for_init(track):
-                pending_init_features[track.track_id] = (track, np.array(det.tlbr, dtype=np.float32))
+                pending_init_features[track.internal_id] = (track, np.array(det.tlbr, dtype=np.float32))
 
         for it in u_track:
             track = r_tracked_stracks[it]
@@ -429,10 +447,13 @@ class BoTSORT(object):
 
         matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, thresh=0.7)
         for itracked, idet in matches:
-            unconfirmed[itracked].update(detections[idet], self.frame_id)
-            activated_starcks.append(unconfirmed[itracked])
-            if self.args.with_reid and detections[idet].curr_feat is None and self._track_ready_for_init(unconfirmed[itracked]):
-                pending_init_features[unconfirmed[itracked].track_id] = (unconfirmed[itracked], np.array(detections[idet].tlbr, dtype=np.float32))
+            track = unconfirmed[itracked]
+            track.update(detections[idet], self.frame_id)
+            self._attempt_appearance_recovery(track)
+            self._maybe_confirm_track(track)
+            activated_starcks.append(track)
+            if self.args.with_reid and detections[idet].curr_feat is None and self._track_ready_for_init(track):
+                pending_init_features[track.internal_id] = (track, np.array(detections[idet].tlbr, dtype=np.float32))
         for it in u_unconfirmed:
             track = unconfirmed[it]
             track.mark_removed()
@@ -445,6 +466,8 @@ class BoTSORT(object):
                 continue
 
             track.activate(self.kalman_filter, self.frame_id)
+            self._attempt_appearance_recovery(track)
+            self._maybe_confirm_track(track)
             activated_starcks.append(track)
 
         """ Step 5: Update state"""
@@ -484,6 +507,115 @@ class BoTSORT(object):
 
 
         return output_stracks
+
+    def _attempt_appearance_recovery(self, track):
+        if not getattr(self.args, 'with_reid', False):
+            logger.debug(
+                "Frame {}: skip appearance recovery for track {} (ReID disabled)",
+                self.frame_id,
+                getattr(track, 'internal_id', None)
+            )
+            return False
+        if track is None:
+            logger.debug("Frame {}: skip appearance recovery (track is None)", self.frame_id)
+            return False
+        if track.has_assigned_id:
+            logger.debug(
+                "Frame {}: skip appearance recovery for track {} (already assigned)",
+                self.frame_id,
+                getattr(track, 'internal_id', None)
+            )
+            return False
+        if track.curr_feat is None:
+            logger.debug(
+                "Frame {}: skip appearance recovery for track {} (no current feature yet)",
+                self.frame_id,
+                getattr(track, 'internal_id', None)
+            )
+            return False
+
+        history_tracks = [
+            t for t in (self.lost_stracks + self.removed_stracks)
+            if getattr(t, 'smooth_feat', None) is not None and getattr(t, 'has_assigned_id', False)
+        ]
+        if not history_tracks:
+            logger.debug(
+                "Frame {}: appearance recovery for track {} found no historical candidates",
+                self.frame_id,
+                getattr(track, 'internal_id', None)
+            )
+            return False
+
+        cost_matrix = matching.embedding_distance(history_tracks, [track])
+        if cost_matrix.size == 0:
+            logger.debug(
+                "Frame {}: appearance recovery for track {} yielded empty cost matrix",
+                self.frame_id,
+                getattr(track, 'internal_id', None)
+            )
+            return False
+
+        best_idx = int(np.argmin(cost_matrix[:, 0]))
+        best_cost = cost_matrix[best_idx, 0]
+        logger.debug(
+            "Frame {}: appearance recovery candidate for track {} -> historical {} with cost {:.3f}",
+            self.frame_id,
+            getattr(track, 'internal_id', None),
+            getattr(history_tracks[best_idx], 'internal_id', None),
+            float(best_cost)
+        )
+        if not np.isfinite(best_cost) or best_cost > self.appearance_thresh:
+            logger.debug(
+                "Frame {}: appearance recovery rejected for track {} (cost {:.3f} > threshold {:.3f})",
+                self.frame_id,
+                getattr(track, 'internal_id', None),
+                float(best_cost),
+                float(self.appearance_thresh)
+            )
+            return False
+
+        matched_track = history_tracks[best_idx]
+        self._adopt_identity_from_history(track, matched_track, best_cost)
+        return True
+
+    def _maybe_confirm_track(self, track):
+        if track is None or track.has_assigned_id:
+            return False
+        if track.start_frame is None:
+            return False
+        track_age = (self.frame_id - track.start_frame + 1)
+        if track_age >= self.reid_min_track_age:
+            track.assign_identity()
+            return True
+        return False
+
+    def _adopt_identity_from_history(self, provisional_track, historical_track, distance_cost):
+        if historical_track in self.lost_stracks:
+            self.lost_stracks.remove(historical_track)
+        if historical_track in self.removed_stracks:
+            self.removed_stracks.remove(historical_track)
+
+        provisional_track.internal_id = historical_track.internal_id
+        provisional_track.track_id = historical_track.track_id
+        provisional_track.has_assigned_id = True
+        provisional_track.is_activated = True
+        provisional_track.start_frame = historical_track.start_frame
+        provisional_track.tracklet_len = historical_track.tracklet_len
+
+        if getattr(historical_track, 'features', None):
+            provisional_track.features = deque(historical_track.features, maxlen=historical_track.features.maxlen)
+        if getattr(historical_track, 'smooth_feat', None) is not None:
+            provisional_track.smooth_feat = historical_track.smooth_feat.copy()
+
+        if provisional_track.curr_feat is not None:
+            provisional_track.update_features(provisional_track.curr_feat)
+
+        logger.info(
+            "Frame {}: appearance recovery reassigned lost track {} to provisional track (cosine distance {:.3f})",
+            self.frame_id,
+            provisional_track.track_id,
+            float(distance_cost)
+        )
 
     def _select_reid_candidates(self, cost_matrix, tracks, detections):
         if cost_matrix.size == 0 or len(tracks) == 0 or len(detections) == 0:
@@ -638,16 +770,20 @@ class BoTSORT(object):
         feats = self.encoder.inference(img, boxes)
         for (track, _), feat in zip(pending_features.values(), feats):
             track.update_features(feat)
+            if not track.has_assigned_id:
+                self._attempt_appearance_recovery(track)
+                self._maybe_confirm_track(track)
 
 
 def joint_stracks(tlista, tlistb):
     exists = {}
     res = []
     for t in tlista:
-        exists[t.track_id] = 1
+        key = getattr(t, 'internal_id', t.track_id)
+        exists[key] = 1
         res.append(t)
     for t in tlistb:
-        tid = t.track_id
+        tid = getattr(t, 'internal_id', t.track_id)
         if not exists.get(tid, 0):
             exists[tid] = 1
             res.append(t)
@@ -657,9 +793,9 @@ def joint_stracks(tlista, tlistb):
 def sub_stracks(tlista, tlistb):
     stracks = {}
     for t in tlista:
-        stracks[t.track_id] = t
+        stracks[getattr(t, 'internal_id', t.track_id)] = t
     for t in tlistb:
-        tid = t.track_id
+        tid = getattr(t, 'internal_id', t.track_id)
         if stracks.get(tid, 0):
             del stracks[tid]
     return list(stracks.values())
