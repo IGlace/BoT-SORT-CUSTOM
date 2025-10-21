@@ -287,6 +287,13 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
         with open(res_file, 'w') as f:
             f.writelines(results)
         logger.info(f"save results to {res_file}")
+    
+    # Log total processing time and statistics
+    total_time = timer.total_time
+    avg_fps = frame_id / total_time if total_time > 0 else 0
+    logger.info(f"Total processing time: {total_time:.2f} seconds for {frame_id} frames ({avg_fps:.2f} fps average)")
+    if args.with_reid:
+        logger.info(f"ReID stats: Used in {tracker.total_reid_frames} frames, total {tracker.total_reid_calls} ReID calls")
 
 
 def main(exp, args):

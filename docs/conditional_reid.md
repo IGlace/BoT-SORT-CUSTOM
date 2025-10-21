@@ -5,6 +5,7 @@ This document summarizes the real-time ReID optimizations added to the BoT-SORT 
 ## What Changed
 - **Lazy ReID triggering** – FastReID inference now runs only when the IoU-based association appears ambiguous. Ambiguity is detected per frame and per detection via `reid_ambiguity_thresh` and `reid_overlap_thresh`.
 - **Per-stage instrumentation** – The tracker emits Loguru messages detailing which frames/stages require appearance cues, making it easier to profile ReID usage.
+- **Frame-level summary logging** – Each call to `BoTSORT.update` now reports whether ReID fired, how many detections were encoded, and how many frames overall have relied on appearance cues.
 - **Deferred feature seeding** – Confirmed tracks queue a single appearance extraction once they have been stable for `reid_min_track_age` frames, avoiding immediate encoder calls while keeping features ready for future conflicts.
 - **Partial embedding fusion** – Cost matrices fall back to IoU everywhere except the rows/columns where embeddings are available, preventing unnecessary encoder work.
 
@@ -21,6 +22,27 @@ This document summarizes the real-time ReID optimizations added to the BoT-SORT 
 | `reid_min_track_age` | 3 | Number of consecutive frames a track must remain active before its first deferred appearance capture. | Lower ⇒ earlier feature snapshots (small upfront cost). Higher ⇒ minimal cost but weaker resilience to early occlusions. |
 
 These values can be supplied on the CLI (e.g. `--reid-ambiguity-thresh 0.15`). If not provided, BoT-SORT uses the defaults above.
+
+### Making the thresholds looser or tighter
+
+- `reid_ambiguity_thresh`
+  - **Increase** (e.g. to `0.15`–`0.2`): treat even mild score differences as ambiguous ⇒ ReID runs more often, improving ID stability but increasing latency.
+  - **Decrease** (e.g. to `0.05`): only very close IoU ties trigger ReID ⇒ fastest option, higher chance of ID switches in crowded scenes.
+- `reid_overlap_thresh`
+  - **Increase** (e.g. `0.5`–`0.6`): only near-identical boxes count as overlapping ⇒ fewer appearance checks, best for sparse scenes.
+  - **Decrease** (e.g. `0.3`): small overlaps already trigger ReID ⇒ heavier compute, useful when people often brush past each other.
+- `reid_min_track_age`
+  - **Increase** (e.g. `4`–`5`): delay the first feature snapshot ⇒ minimal ReID use, but new tracks are vulnerable to early occlusions.
+  - **Decrease** (e.g. `2`): capture appearance sooner ⇒ slight extra cost, better robustness to quick re-entries.
+
+### Recommended presets
+
+| Scenario | `reid_ambiguity_thresh` | `reid_overlap_thresh` | `reid_min_track_age` | Notes |
+|----------|-------------------------|-----------------------|----------------------|-------|
+| **Balanced default** | 0.10 | 0.40 | 3 | Works well for mixed indoor/outdoor footage. |
+| **Crowded indoor scene** | 0.12–0.18 | 0.30–0.35 | 2 | Prioritises ID stability when people cross paths frequently. |
+| **Sparse outdoor tracking** | 0.06–0.08 | 0.50–0.60 | 3–4 | Minimises ReID calls when targets rarely overlap. |
+| **Latency-critical demo** | 0.05 | 0.45 | 4 | Sacrifices some robustness for the lowest encoder usage. |
 
 ## Strategies For Balancing Speed & ID Stability
 1. **Ambiguity gap tuning** – Start with `reid_ambiguity_thresh=0.1` and increase gradually until identity swaps disappear on your footage. Monitor the log outputs to confirm ReID frequency.

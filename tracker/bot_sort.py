@@ -228,9 +228,13 @@ class BoTSORT(object):
             self.encoder = FastReIDInterface(args.fast_reid_config, args.fast_reid_weights, args.device)
 
         self.gmc = GMC(method=args.cmc_method, verbose=[args.name, args.ablation])
-        self.reid_ambiguity_thresh = getattr(args, 'reid_ambiguity_thresh', 0.1)
-        self.reid_overlap_thresh = getattr(args, 'reid_overlap_thresh', 0.4)
-        self.reid_min_track_age = getattr(args, 'reid_min_track_age', 3)
+        self.reid_ambiguity_thresh = getattr(args, 'reid_ambiguity_thresh', 0.05)
+        self.reid_overlap_thresh = getattr(args, 'reid_overlap_thresh', 0.7)
+        self.reid_min_track_age = getattr(args, 'reid_min_track_age', 4)
+        self.total_reid_frames = 0
+        self.total_reid_calls = 0
+        self._reid_used_this_frame = False
+        self._reid_calls_current_frame = 0
 
     def update(self, output_results, img):
         self.frame_id += 1
@@ -239,6 +243,8 @@ class BoTSORT(object):
         lost_stracks = []
         removed_stracks = []
         pending_init_features = {}
+        self._reid_used_this_frame = False
+        self._reid_calls_current_frame = 0
 
         if len(output_results):
             if output_results.shape[1] == 5:
@@ -460,6 +466,19 @@ class BoTSORT(object):
         if self.args.with_reid:
             self._process_pending_initial_features(img, pending_init_features, self.frame_id)
 
+        if self._reid_used_this_frame:
+            self.total_reid_frames += 1
+
+        logger.info(
+            "Frame {} summary: ReID used this frame: {} (calls this frame: {}, total frames with ReID: {}, total ReID calls: {})",
+            self.frame_id,
+            self._reid_used_this_frame,
+            self._reid_calls_current_frame,
+            self.total_reid_frames,
+            self.total_reid_calls
+        )
+        logger.info("================================================")
+
         # output_stracks = [track for track in self.tracked_stracks if track.is_activated]
         output_stracks = [track for track in self.tracked_stracks]
 
@@ -469,6 +488,19 @@ class BoTSORT(object):
     def _select_reid_candidates(self, cost_matrix, tracks, detections):
         if cost_matrix.size == 0 or len(tracks) == 0 or len(detections) == 0:
             return [], []
+
+        # Log the cost matrix
+        logger.debug(
+            "\nReID Selection Cost Matrix Details:\n"
+            "Cost Matrix Shape: {}\n"
+            "Cost Matrix:\n{}\n"
+            "Track Count: {}\n"
+            "Detection Count: {}\n",
+            cost_matrix.shape,
+            np.array2string(cost_matrix, precision=3, suppress_small=True),
+            len(tracks),
+            len(detections)
+        )
 
         ambiguous_tracks = set()
         ambiguous_dets = set()
@@ -514,6 +546,25 @@ class BoTSORT(object):
             return
         if img is None or self.encoder is None:
             return
+            
+        # Debug logging for ReID selection
+        logger.debug(
+            "\nReID Selection Details (Frame {}, {} stage):\n" 
+            "Selected Detection Indices: {}\n"
+            "Selected Track Indices: {}\n"
+            "Number of Total Detections: {}\n"
+            "Number of Total Tracks: {}\n"
+            "Detection Boxes: {}\n"
+            "Track States: {}\n",
+            frame_id,
+            stage,
+            det_indices,
+            track_indices if track_indices is not None else "N/A",
+            len(detections),
+            len(tracks) if tracks is not None else "N/A",
+            [det.tlwh.tolist() for det in detections] if detections else "N/A",
+            [(t.track_id, t.state) for t in tracks] if tracks else "N/A"
+        )
 
         unique_indices = sorted(set(det_indices))
         if raw_boxes is not None:
@@ -526,6 +577,10 @@ class BoTSORT(object):
         associated_tracks = []
         if track_indices is not None and tracks is not None:
             associated_tracks = [tracks[idx].track_id for idx in track_indices if idx < len(tracks)]
+
+        self._reid_used_this_frame = True
+        self._reid_calls_current_frame += len(unique_indices)
+        self.total_reid_calls += len(unique_indices)
 
         logger.info(
             "Frame {}: ReID triggered at '{}' stage for detections {} (boxes {}). Tracks involved: {}",
@@ -571,6 +626,9 @@ class BoTSORT(object):
         boxes = np.asarray([item[1] for item in pending_features.values()], dtype=np.float32)
         if boxes.size == 0:
             return
+        self._reid_used_this_frame = True
+        self._reid_calls_current_frame += len(pending_features)
+        self.total_reid_calls += len(pending_features)
         track_ids = [item[0].track_id for item in pending_features.values()]
         logger.info(
             "Frame {}: Capturing initial ReID features for confirmed tracks {}",
