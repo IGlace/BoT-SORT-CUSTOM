@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import deque
 
+from loguru import logger
+
 from tracker import matching
 from tracker.gmc import GMC
 from tracker.basetrack import BaseTrack, TrackState
@@ -14,7 +16,16 @@ from fast_reid.fast_reid_interfece import FastReIDInterface
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
 
-    def __init__(self, tlwh, score, feat=None, feat_history=50):
+    def __init__(
+        self,
+        tlwh,
+        score,
+        feat=None,
+        feat_history=50,
+        activation_wait=30,
+        pre_activation_collect=5,
+        is_detection_proxy=False,
+    ):
 
         # wait activate
         self._tlwh = np.asarray(tlwh, dtype=np.float)
@@ -27,20 +38,68 @@ class STrack(BaseTrack):
 
         self.smooth_feat = None
         self.curr_feat = None
-        if feat is not None:
-            self.update_features(feat)
         self.features = deque([], maxlen=feat_history)
         self.alpha = 0.9
 
-    def update_features(self, feat):
+        self.activation_wait = activation_wait
+        self.pre_activation_collect = pre_activation_collect
+        self.frames_since_first_seen = 0
+        self.public_track_id = -1
+        self.pre_activation_features = deque([], maxlen=max(1, pre_activation_collect))
+        self.is_detection_proxy = is_detection_proxy
+
+        if feat is not None:
+            self.update_features(feat, force=True)
+
+    def update_features(self, feat, force=False):
+        if feat is None:
+            return
         feat /= np.linalg.norm(feat)
         self.curr_feat = feat
+
+        if self.is_detection_proxy:
+            self.smooth_feat = feat
+            return
+
+        if self.public_track_id == -1 and not force:
+            if self.frames_since_first_seen >= max(0, self.activation_wait - self.pre_activation_collect):
+                self.pre_activation_features.append(feat)
+            return
+
         if self.smooth_feat is None:
             self.smooth_feat = feat
         else:
             self.smooth_feat = self.alpha * self.smooth_feat + (1 - self.alpha) * feat
         self.features.append(feat)
         self.smooth_feat /= np.linalg.norm(self.smooth_feat)
+
+    def commit_pre_activation_features(self):
+        while self.pre_activation_features:
+            feat = self.pre_activation_features.popleft()
+            self.update_features(feat, force=True)
+
+    def get_public_id(self):
+        return self.public_track_id
+
+    def ready_for_public_id(self):
+        return self.public_track_id == -1 and self.frames_since_first_seen >= self.activation_wait
+
+    def average_pre_activation_feature(self):
+        if not self.pre_activation_features:
+            return None
+        feat = np.mean(np.stack(self.pre_activation_features, axis=0), axis=0)
+        norm = np.linalg.norm(feat)
+        if norm == 0:
+            return None
+        return feat / norm
+
+    def copy_features_from(self, other_track):
+        if other_track.smooth_feat is not None:
+            self.smooth_feat = other_track.smooth_feat.copy()
+        if other_track.curr_feat is not None:
+            self.curr_feat = other_track.curr_feat.copy()
+        if hasattr(other_track, "features"):
+            self.features = deque(list(other_track.features), maxlen=self.features.maxlen)
 
     def predict(self):
         mean_state = self.mean.copy()
@@ -95,18 +154,26 @@ class STrack(BaseTrack):
             self.is_activated = True
         self.frame_id = frame_id
         self.start_frame = frame_id
+        self.frames_since_first_seen = 1
+        self.public_track_id = -1
+        self.pre_activation_features.clear()
 
     def re_activate(self, new_track, frame_id, new_id=False):
 
         self.mean, self.covariance = self.kalman_filter.update(self.mean, self.covariance, self.tlwh_to_xywh(new_track.tlwh))
         if new_track.curr_feat is not None:
-            self.update_features(new_track.curr_feat)
+            self.update_features(new_track.curr_feat, force=True)
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         self.is_activated = True
         self.frame_id = frame_id
         if new_id:
             self.track_id = self.next_id()
+            self.public_track_id = self.track_id
+        else:
+            if self.public_track_id == -1:
+                self.public_track_id = self.track_id
+        self.frames_since_first_seen = max(self.frames_since_first_seen, self.activation_wait)
         self.score = new_track.score
 
     def update(self, new_track, frame_id):
@@ -119,6 +186,7 @@ class STrack(BaseTrack):
         """
         self.frame_id = frame_id
         self.tracklet_len += 1
+        self.frames_since_first_seen += 1
 
         new_tlwh = new_track.tlwh
 
@@ -214,13 +282,20 @@ class BoTSORT(object):
         self.track_low_thresh = args.track_low_thresh
         self.new_track_thresh = args.new_track_thresh
 
+        self.activation_wait = getattr(args, "activation_wait", 30)
+        self.pre_activation_collect = getattr(args, "pre_activation_frames", 5)
+        lost_seconds = getattr(args, "lost_track_buffer_seconds", 300.0)
         self.buffer_size = int(frame_rate / 30.0 * args.track_buffer)
-        self.max_time_lost = self.buffer_size
+        self.max_time_lost = max(self.buffer_size, int(frame_rate * lost_seconds))
         self.kalman_filter = KalmanFilter()
 
         # ReID module
         self.proximity_thresh = args.proximity_thresh
         self.appearance_thresh = args.appearance_thresh
+        self.overlap_iou_reid_thresh = getattr(args, "overlap_reid_iou_thresh", 0.6)
+
+        self.reid_usage_count = 0
+        self.reid_feature_total = 0
 
         if args.with_reid:
             self.encoder = FastReIDInterface(args.fast_reid_config, args.fast_reid_weights, args.device)
@@ -264,18 +339,18 @@ class BoTSORT(object):
             scores_keep = []
             classes_keep = []
 
-        '''Extract embeddings '''
-        if self.args.with_reid:
-            features_keep = self.encoder.inference(img, dets)
-
         if len(dets) > 0:
             '''Detections'''
-            if self.args.with_reid:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, f) for
-                              (tlbr, s, f) in zip(dets, scores_keep, features_keep)]
-            else:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                              (tlbr, s) in zip(dets, scores_keep)]
+            detections = [
+                STrack(
+                    STrack.tlbr_to_tlwh(tlbr),
+                    s,
+                    activation_wait=self.activation_wait,
+                    pre_activation_collect=self.pre_activation_collect,
+                    is_detection_proxy=True,
+                )
+                for (tlbr, s) in zip(dets, scores_keep)
+            ]
         else:
             detections = []
 
@@ -299,42 +374,78 @@ class BoTSORT(object):
         STrack.multi_gmc(strack_pool, warp)
         STrack.multi_gmc(unconfirmed, warp)
 
-        # Associate with high score detection boxes
+        # Associate with high score detection boxes using IoU first
         ious_dists = matching.iou_distance(strack_pool, detections)
-        ious_dists_mask = (ious_dists > self.proximity_thresh)
 
         if not self.args.mot20:
             ious_dists = matching.fuse_score(ious_dists, detections)
 
-        if self.args.with_reid:
-            emb_dists = matching.embedding_distance(strack_pool, detections) / 2.0
-            raw_emb_dists = emb_dists.copy()
-            emb_dists[emb_dists > self.appearance_thresh] = 1.0
-            emb_dists[ious_dists_mask] = 1.0
-            dists = np.minimum(ious_dists, emb_dists)
+        matches, u_track, u_detection = matching.linear_assignment(ious_dists, thresh=self.proximity_thresh)
 
-            # Popular ReID method (JDE / FairMOT)
-            # raw_emb_dists = matching.embedding_distance(strack_pool, detections)
-            # dists = matching.fuse_motion(self.kalman_filter, raw_emb_dists, strack_pool, detections)
-            # emb_dists = dists
-
-            # IoU making ReID
-            # dists = matching.embedding_distance(strack_pool, detections)
-            # dists[ious_dists_mask] = 1.0
-        else:
-            dists = ious_dists
-
-        matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.args.match_thresh)
+        match_pairs = []
+        track_detection_map = {}
 
         for itracked, idet in matches:
             track = strack_pool[itracked]
             det = detections[idet]
             if track.state == TrackState.Tracked:
-                track.update(detections[idet], self.frame_id)
+                match_pairs.append(("update", track, det))
+            else:
+                match_pairs.append(("reactivate", track, det))
+
+        # ReID based association for unresolved matches
+        reid_track_indices = list(u_track)
+        reid_det_indices = list(u_detection)
+        if self.args.with_reid and len(reid_det_indices) > 0:
+            reid_track_candidates = [strack_pool[i] for i in reid_track_indices]
+            reid_det_candidates = [detections[i] for i in reid_det_indices]
+
+            self._extract_reid_features(img, reid_det_candidates, reason="unmatched detections")
+
+            valid_track_mask = [t.smooth_feat is not None for t in reid_track_candidates]
+            valid_tracks = [t for t, keep in zip(reid_track_candidates, valid_track_mask) if keep]
+            if valid_tracks:
+                emb_dists = matching.embedding_distance(valid_tracks, reid_det_candidates)
+                emb_dists[emb_dists > self.appearance_thresh] = 1.0
+                matches_reid, _, _ = matching.linear_assignment(emb_dists, thresh=self.appearance_thresh)
+
+                matched_track_indices = set()
+                matched_det_indices = set()
+                valid_indices = [idx for idx, keep in enumerate(valid_track_mask) if keep]
+
+                for local_track_idx, local_det_idx in matches_reid:
+                    global_track_idx = valid_indices[local_track_idx]
+                    track = reid_track_candidates[global_track_idx]
+                    det = reid_det_candidates[local_det_idx]
+                    if track.state == TrackState.Tracked:
+                        match_pairs.append(("update", track, det))
+                    else:
+                        match_pairs.append(("reactivate", track, det))
+                    matched_track_indices.add(global_track_idx)
+                    matched_det_indices.add(local_det_idx)
+
+                remaining_track_indices = [idx for idx in range(len(reid_track_candidates)) if idx not in matched_track_indices]
+                remaining_det_indices = [idx for idx in range(len(reid_det_candidates)) if idx not in matched_det_indices]
+                u_track = tuple(reid_track_indices[idx] for idx in remaining_track_indices)
+                u_detection = tuple(reid_det_indices[idx] for idx in remaining_det_indices)
+            else:
+                u_track = tuple(reid_track_indices)
+                u_detection = tuple(reid_det_indices)
+
+        # Ensure appearance features for tracks close to activation
+        self._ensure_pre_activation_features(img, match_pairs)
+
+        for action, track, det in match_pairs:
+            if action == "update":
+                track.update(det, self.frame_id)
                 activated_starcks.append(track)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
+            track_detection_map[track.track_id] = det
+            self._attempt_public_activation(track)
+
+        self._handle_overlap_reid(img, track_detection_map)
 
         ''' Step 3: Second association, with low score detection boxes'''
         if len(scores):
@@ -369,6 +480,7 @@ class BoTSORT(object):
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
+            self._attempt_public_activation(track)
 
         for it in u_track:
             track = r_tracked_stracks[it]
@@ -409,6 +521,7 @@ class BoTSORT(object):
 
             track.activate(self.kalman_filter, self.frame_id)
             activated_starcks.append(track)
+            self._attempt_public_activation(track)
 
         """ Step 5: Update state"""
         for track in self.lost_stracks:
@@ -429,8 +542,133 @@ class BoTSORT(object):
         # output_stracks = [track for track in self.tracked_stracks if track.is_activated]
         output_stracks = [track for track in self.tracked_stracks]
 
+        if self.args.with_reid:
+            logger.debug(
+                f"Frame {self.frame_id}: cumulative ReID calls={self.reid_usage_count}, total candidates={self.reid_feature_total}."
+            )
 
         return output_stracks
+
+    def _ensure_pre_activation_features(self, img, match_pairs):
+        if not self.args.with_reid:
+            return
+
+        detections_to_process = []
+        seen = set()
+        for _, track, det in match_pairs:
+            if det.curr_feat is not None:
+                continue
+            if track.get_public_id() != -1:
+                continue
+            threshold_frame = max(0, track.activation_wait - track.pre_activation_collect)
+            if track.frames_since_first_seen < threshold_frame:
+                continue
+            key = id(det)
+            if key in seen:
+                continue
+            detections_to_process.append(det)
+            seen.add(key)
+
+        if detections_to_process:
+            self._extract_reid_features(img, detections_to_process, reason="pre-activation feature collection")
+
+    def _attempt_public_activation(self, track):
+        if not track.ready_for_public_id():
+            return
+
+        candidate_feature = track.average_pre_activation_feature()
+        logger.debug(
+            f"Frame {self.frame_id}: track {track.track_id} ready for public id assignment; comparing with lost tracks."
+        )
+
+        matched_lost = None
+        if self.args.with_reid and candidate_feature is not None and self.lost_stracks:
+            available_lost = [lt for lt in self.lost_stracks if lt.smooth_feat is not None]
+            if available_lost:
+                original_feat = track.curr_feat
+                track.curr_feat = candidate_feature
+                dists = matching.embedding_distance(available_lost, [track])
+                track.curr_feat = original_feat
+                if dists.size > 0:
+                    min_idx = int(np.argmin(dists[:, 0]))
+                    min_dist = dists[min_idx, 0]
+                    logger.debug(
+                        f"Frame {self.frame_id}: best lost-track distance for track {track.track_id} is {min_dist:.4f}."
+                    )
+                    if min_dist <= self.appearance_thresh:
+                        matched_lost = available_lost[min_idx]
+
+        if matched_lost is not None:
+            logger.info(
+                f"Frame {self.frame_id}: reassigned track {track.track_id} to previous id {matched_lost.track_id} using lost-track appearance."
+            )
+            track.copy_features_from(matched_lost)
+            track.commit_pre_activation_features()
+            track.public_track_id = matched_lost.get_public_id() if matched_lost.get_public_id() != -1 else matched_lost.track_id
+            track.track_id = matched_lost.track_id
+            self._remove_lost_track(matched_lost)
+        else:
+            track.commit_pre_activation_features()
+            track.public_track_id = track.track_id
+            if candidate_feature is None:
+                logger.warning(
+                    f"Frame {self.frame_id}: track {track.track_id} activated without appearance feature; assigning new id."
+                )
+            else:
+                logger.info(
+                    f"Frame {self.frame_id}: assigned new public id {track.track_id} after waiting period."
+                )
+
+    def _handle_overlap_reid(self, img, track_detection_map):
+        if not self.args.with_reid or len(track_detection_map) < 2:
+            return
+
+        tracks_with_dets = [track for track in self.tracked_stracks if track.track_id in track_detection_map]
+        if len(tracks_with_dets) < 2:
+            return
+
+        overlap_candidates = {}
+        for i in range(len(tracks_with_dets)):
+            for j in range(i + 1, len(tracks_with_dets)):
+                track_a = tracks_with_dets[i]
+                track_b = tracks_with_dets[j]
+                iou_dist = matching.iou_distance([track_a], [track_b])
+                overlap = 1 - float(iou_dist[0][0])
+                if overlap > self.overlap_iou_reid_thresh:
+                    det_a = track_detection_map.get(track_a.track_id)
+                    det_b = track_detection_map.get(track_b.track_id)
+                    if det_a is not None and det_a.curr_feat is None:
+                        overlap_candidates[id(det_a)] = (det_a, track_a)
+                    if det_b is not None and det_b.curr_feat is None:
+                        overlap_candidates[id(det_b)] = (det_b, track_b)
+
+        if overlap_candidates:
+            detections = [item[0] for item in overlap_candidates.values()]
+            self._extract_reid_features(img, detections, reason="overlap potential", force=True)
+            for det, parent_track in overlap_candidates.values():
+                if det.curr_feat is not None:
+                    parent_track.update_features(det.curr_feat, force=True)
+                    self._attempt_public_activation(parent_track)
+
+    def _extract_reid_features(self, img, track_candidates, reason, force=False):
+        if not self.args.with_reid or not track_candidates:
+            return
+
+        boxes = np.asarray([STrack.tlwh_to_tlbr(track.tlwh) for track in track_candidates], dtype=np.float32)
+        features = self.encoder.inference(img, boxes)
+        self.reid_usage_count += 1
+        self.reid_feature_total += len(track_candidates)
+        logger.debug(
+            f"Frame {self.frame_id}: ReID inference #{self.reid_usage_count} for {len(track_candidates)} candidates ({reason})."
+        )
+        for candidate, feat in zip(track_candidates, features):
+            candidate.update_features(feat, force=force)
+
+    def _remove_lost_track(self, lost_track):
+        if lost_track in self.lost_stracks:
+            self.lost_stracks.remove(lost_track)
+        if lost_track in self.removed_stracks:
+            self.removed_stracks.remove(lost_track)
 
 
 def joint_stracks(tlista, tlistb):

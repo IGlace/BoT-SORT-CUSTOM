@@ -59,6 +59,10 @@ def make_parser():
     parser.add_argument("--fast-reid-weights", dest="fast_reid_weights", default=r"pretrained/mot17_sbs_S50.pth", type=str,help="reid config file path")
     parser.add_argument('--proximity_thresh', type=float, default=0.5, help='threshold for rejecting low overlap reid matches')
     parser.add_argument('--appearance_thresh', type=float, default=0.25, help='threshold for rejecting low appearance similarity reid matches')
+    parser.add_argument('--activation-wait', type=int, default=30, help='frames to wait before assigning public track ids')
+    parser.add_argument('--pre-activation-frames', type=int, default=5, help='frames of appearance to collect prior to activation')
+    parser.add_argument('--lost-track-buffer-seconds', type=float, default=300.0, help='seconds to retain lost tracks before removal')
+    parser.add_argument('--overlap-reid-iou-thresh', type=float, default=0.6, help='IoU threshold to trigger ReID refresh for overlapping tracks')
     return parser
 
 
@@ -176,16 +180,17 @@ def image_demo(predictor, vis_folder, current_time, args):
             online_scores = []
             for t in online_targets:
                 tlwh = t.tlwh
-                tid = t.track_id
+                tid = t.get_public_id() if hasattr(t, "get_public_id") else t.track_id
                 vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
                 if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
                     online_tlwhs.append(tlwh)
                     online_ids.append(tid)
                     online_scores.append(t.score)
                     # save results
-                    results.append(
-                        f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
-                    )
+                    if tid >= 0:
+                        results.append(
+                            f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
+                        )
             timer.toc()
             online_im = plot_tracking(
                 img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / timer.average_time
