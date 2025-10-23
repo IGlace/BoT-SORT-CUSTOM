@@ -49,6 +49,10 @@ def make_parser():
     parser.add_argument("--aspect_ratio_thresh", type=float, default=1.6, help="threshold for filtering out boxes of which aspect ratio are above the given value.")
     parser.add_argument('--min_box_area', type=float, default=10, help='filter out tiny boxes')
     parser.add_argument("--fuse-score", dest="fuse_score", default=False, action="store_true", help="fuse score and iou for association")
+    parser.add_argument("--activation-wait", dest="activation_wait", type=int, default=30, help="frames to wait before assigning a public track id")
+    parser.add_argument("--pre-activation-frames", dest="pre_activation_frames", type=int, default=5, help="number of frames of appearance to collect before activation")
+    parser.add_argument("--lost-track-buffer-time", dest="lost_track_buffer_time", type=float, default=300.0, help="seconds to keep lost tracks available for re-identification")
+    parser.add_argument("--reid-overlap-iou", dest="reid_overlap_iou", type=float, default=0.6, help="IoU threshold that triggers ReID usage for overlap handling")
 
     # CMC
     parser.add_argument("--cmc-method", default="orb", type=str, help="cmc method: files (Vidstab GMC) | orb | ecc")
@@ -176,7 +180,7 @@ def image_demo(predictor, vis_folder, current_time, args):
             online_scores = []
             for t in online_targets:
                 tlwh = t.tlwh
-                tid = t.track_id
+                tid = getattr(t, "display_id", t.track_id)
                 vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
                 if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
                     online_tlwhs.append(tlwh)
@@ -257,7 +261,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
                 online_scores = []
                 for t in online_targets:
                     tlwh = t.tlwh
-                    tid = t.track_id
+                    tid = getattr(t, "display_id", t.track_id)
                     vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
                     if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
                         online_tlwhs.append(tlwh)
