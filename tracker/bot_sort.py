@@ -2,6 +2,7 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from collections import deque
+from loguru import logger
 
 from tracker import matching
 from tracker.gmc import GMC
@@ -13,8 +14,18 @@ from fast_reid.fast_reid_interfece import FastReIDInterface
 
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
+    pending_id_counter = 0
 
-    def __init__(self, tlwh, score, feat=None, feat_history=50):
+    @classmethod
+    def next_pending_id(cls):
+        cls.pending_id_counter -= 1
+        return cls.pending_id_counter
+
+    @classmethod
+    def reset_pending_count(cls):
+        cls.pending_id_counter = 0
+
+    def __init__(self, tlwh, score, feat=None, feat_history=50, activation_wait=30, feature_warmup=5):
 
         # wait activate
         self._tlwh = np.asarray(tlwh, dtype=np.float)
@@ -31,6 +42,11 @@ class STrack(BaseTrack):
             self.update_features(feat)
         self.features = deque([], maxlen=feat_history)
         self.alpha = 0.9
+
+        self.activation_wait = max(0, activation_wait)
+        self.feature_warmup = 0 if self.activation_wait == 0 else max(0, min(feature_warmup, self.activation_wait))
+        self.pending = False
+        self.pending_start_frame = None
 
     def update_features(self, feat):
         feat /= np.linalg.norm(feat)
@@ -82,19 +98,28 @@ class STrack(BaseTrack):
                 stracks[i].mean = mean
                 stracks[i].covariance = cov
 
-    def activate(self, kalman_filter, frame_id):
+    def activate(self, kalman_filter, frame_id, assign_id=True, feat=None):
         """Start a new tracklet"""
         self.kalman_filter = kalman_filter
-        self.track_id = self.next_id()
+        if assign_id:
+            self.track_id = self.next_id()
+            self.pending = False
+            self.pending_start_frame = None
+        else:
+            self.track_id = self.next_pending_id()
+            self.pending = True
+            self.pending_start_frame = frame_id
 
         self.mean, self.covariance = self.kalman_filter.initiate(self.tlwh_to_xywh(self._tlwh))
 
         self.tracklet_len = 0
         self.state = TrackState.Tracked
-        if frame_id == 1:
-            self.is_activated = True
+        self.is_activated = assign_id
         self.frame_id = frame_id
         self.start_frame = frame_id
+
+        if feat is not None and (assign_id or self.should_collect_features(frame_id)):
+            self.update_features(feat)
 
     def re_activate(self, new_track, frame_id, new_id=False):
 
@@ -104,6 +129,8 @@ class STrack(BaseTrack):
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         self.is_activated = True
+        self.pending = False
+        self.pending_start_frame = None
         self.frame_id = frame_id
         if new_id:
             self.track_id = self.next_id()
@@ -125,12 +152,35 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.update(self.mean, self.covariance, self.tlwh_to_xywh(new_tlwh))
 
         if new_track.curr_feat is not None:
-            self.update_features(new_track.curr_feat)
+            if not self.pending or self.should_collect_features(frame_id):
+                self.update_features(new_track.curr_feat)
 
         self.state = TrackState.Tracked
-        self.is_activated = True
+        self.is_activated = not self.pending
 
         self.score = new_track.score
+
+    def should_collect_features(self, frame_id):
+        if not self.pending or self.activation_wait <= 0:
+            return False
+        frames_elapsed = frame_id - self.start_frame
+        warmup_start = max(0, self.activation_wait - self.feature_warmup)
+        return frames_elapsed >= warmup_start
+
+    def ready_for_promotion(self, frame_id):
+        if not self.pending:
+            return False
+        frames_elapsed = frame_id - self.start_frame
+        return frames_elapsed >= self.activation_wait
+
+    def promote(self, reuse_id=None):
+        if reuse_id is None:
+            self.track_id = self.next_id()
+        else:
+            self.track_id = reuse_id
+        self.pending = False
+        self.pending_start_frame = None
+        self.is_activated = True
 
     @property
     def tlwh(self):
@@ -206,6 +256,7 @@ class BoTSORT(object):
         self.lost_stracks = []  # type: list[STrack]
         self.removed_stracks = []  # type: list[STrack]
         BaseTrack.clear_count()
+        STrack.reset_pending_count()
 
         self.frame_id = 0
         self.args = args
@@ -215,7 +266,16 @@ class BoTSORT(object):
         self.new_track_thresh = args.new_track_thresh
 
         self.buffer_size = int(frame_rate / 30.0 * args.track_buffer)
-        self.max_time_lost = self.buffer_size
+        lost_track_seconds = getattr(args, "lost_track_buffer_seconds", None)
+        if lost_track_seconds is None:
+            lost_track_seconds = self.buffer_size / max(frame_rate, 1e-6)
+        self.max_time_lost = int(frame_rate * lost_track_seconds)
+        self.activation_wait = max(0, getattr(args, "activation_wait", 0))
+        feature_warmup = max(0, getattr(args, "activation_feature_warmup", 0))
+        self.feature_warmup = min(feature_warmup, self.activation_wait) if self.activation_wait > 0 else 0
+        self.overlap_iou_thresh = getattr(args, "overlap_iou_thresh", 0.5)
+        self.returning_track_match_thresh = getattr(args, "returning_track_match_thresh", args.appearance_thresh)
+
         self.kalman_filter = KalmanFilter()
 
         # ReID module
@@ -224,6 +284,15 @@ class BoTSORT(object):
 
         if args.with_reid:
             self.encoder = FastReIDInterface(args.fast_reid_config, args.fast_reid_weights, args.device)
+        else:
+            self.encoder = None
+        self.reid_usage_count = 0
+        self.reid_comparison_count = 0
+
+        logger.info(
+            "Tracker configuration -> activation_wait: {}, feature_warmup: {}, lost_track_seconds: {}, overlap_iou_thresh: {}".
+            format(self.activation_wait, self.feature_warmup, lost_track_seconds, self.overlap_iou_thresh)
+        )
 
         self.gmc = GMC(method=args.cmc_method, verbose=[args.name, args.ablation])
 
@@ -264,18 +333,18 @@ class BoTSORT(object):
             scores_keep = []
             classes_keep = []
 
-        '''Extract embeddings '''
-        if self.args.with_reid:
-            features_keep = self.encoder.inference(img, dets)
+        features_keep = None
+        pending_needs_features = False
+        if self.args.with_reid and len(dets) > 0:
+            pending_needs_features = self._pending_tracks_need_features()
 
+        detection_kwargs = dict(activation_wait=self.activation_wait, feature_warmup=self.feature_warmup)
         if len(dets) > 0:
             '''Detections'''
-            if self.args.with_reid:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, f) for
-                              (tlbr, s, f) in zip(dets, scores_keep, features_keep)]
-            else:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                              (tlbr, s) in zip(dets, scores_keep)]
+            detections = [
+                STrack(STrack.tlbr_to_tlwh(tlbr), s, **detection_kwargs)
+                for (tlbr, s) in zip(dets, scores_keep)
+            ]
         else:
             detections = []
 
@@ -299,6 +368,33 @@ class BoTSORT(object):
         STrack.multi_gmc(strack_pool, warp)
         STrack.multi_gmc(unconfirmed, warp)
 
+        # Determine whether we need ReID features for this frame
+        need_reid_for_main = False
+        if self.args.with_reid and len(detections) > 0 and len(tracked_stracks) > 0:
+            tracked_iou_cost = matching.iou_distance(tracked_stracks, detections)
+            need_reid_for_main = self._has_overlap(tracked_iou_cost)
+
+        need_features = (
+            self.args.with_reid
+            and len(dets) > 0
+            and (need_reid_for_main or pending_needs_features)
+        )
+        if need_features and self.encoder is not None:
+            features_keep = self.encoder.inference(img, dets)
+            for det, feat in zip(detections, features_keep):
+                det.update_features(feat)
+            self.reid_usage_count += 1
+            reasons = []
+            if need_reid_for_main:
+                reasons.append("overlap")
+            if pending_needs_features:
+                reasons.append("pending_warmup")
+            logger.info(
+                "ReID inference triggered for {} (total usages: {})".format(
+                    "+".join(reasons) if reasons else "unspecified", self.reid_usage_count
+                )
+            )
+
         # Associate with high score detection boxes
         ious_dists = matching.iou_distance(strack_pool, detections)
         ious_dists_mask = (ious_dists > self.proximity_thresh)
@@ -306,7 +402,15 @@ class BoTSORT(object):
         if not self.args.mot20:
             ious_dists = matching.fuse_score(ious_dists, detections)
 
-        if self.args.with_reid:
+        if self.args.with_reid and need_reid_for_main and len(detections) > 0:
+            if features_keep is None and self.encoder is not None:
+                features_keep = self.encoder.inference(img, dets)
+                for det, feat in zip(detections, features_keep):
+                    det.update_features(feat)
+                self.reid_usage_count += 1
+                logger.info(
+                    "ReID inference triggered for overlap (total usages: {})".format(self.reid_usage_count)
+                )
             emb_dists = matching.embedding_distance(strack_pool, detections) / 2.0
             raw_emb_dists = emb_dists.copy()
             emb_dists[emb_dists > self.appearance_thresh] = 1.0
@@ -352,8 +456,10 @@ class BoTSORT(object):
         # association the untrack to the low score detections
         if len(dets_second) > 0:
             '''Detections'''
-            detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                                 (tlbr, s) in zip(dets_second, scores_second)]
+            detections_second = [
+                STrack(STrack.tlbr_to_tlwh(tlbr), s, **detection_kwargs)
+                for (tlbr, s) in zip(dets_second, scores_second)
+            ]
         else:
             detections_second = []
 
@@ -407,7 +513,7 @@ class BoTSORT(object):
             if track.score < self.new_track_thresh:
                 continue
 
-            track.activate(self.kalman_filter, self.frame_id)
+            track.activate(self.kalman_filter, self.frame_id, assign_id=False, feat=track.curr_feat)
             activated_starcks.append(track)
 
         """ Step 5: Update state"""
@@ -424,6 +530,7 @@ class BoTSORT(object):
         self.lost_stracks.extend(lost_stracks)
         self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
         self.removed_stracks.extend(removed_stracks)
+        self._finalize_pending_tracks()
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
 
         # output_stracks = [track for track in self.tracked_stracks if track.is_activated]
@@ -432,6 +539,96 @@ class BoTSORT(object):
 
         return output_stracks
 
+    def _pending_tracks_need_features(self):
+        for track in self.tracked_stracks:
+            if getattr(track, "pending", False) and track.should_collect_features(self.frame_id):
+                return True
+        return False
+
+    def _has_overlap(self, iou_costs):
+        if iou_costs.size == 0:
+            return False
+        overlaps = 1 - iou_costs
+        if overlaps.size == 0:
+            return False
+        return (
+            np.any((overlaps > self.overlap_iou_thresh).sum(axis=0) > 1)
+            or np.any((overlaps > self.overlap_iou_thresh).sum(axis=1) > 1)
+        )
+
+    @staticmethod
+    def _cosine_distance(feat_a, feat_b):
+        if feat_a is None or feat_b is None:
+            return 1.0
+        return 1.0 - float(np.dot(feat_a, feat_b))
+
+    def _match_pending_with_lost(self, pending_track):
+        if pending_track.smooth_feat is None:
+            logger.info("Pending track lacks appearance features for comparison.")
+            return None
+
+        best_track = None
+        best_dist = float("inf")
+        comparisons = 0
+        for lost in self.lost_stracks:
+            if lost.smooth_feat is None:
+                continue
+            dist = self._cosine_distance(pending_track.smooth_feat, lost.smooth_feat)
+            comparisons += 1
+            if dist < best_dist:
+                best_dist = dist
+                best_track = lost
+
+        if comparisons > 0:
+            self.reid_comparison_count += comparisons
+            logger.info(
+                "Compared pending track with {} lost tracks (total comparisons: {})".format(
+                    comparisons, self.reid_comparison_count
+                )
+            )
+        else:
+            logger.info("No eligible lost tracks available for appearance comparison.")
+
+        if best_track is not None and best_dist <= self.returning_track_match_thresh:
+            logger.info(
+                "Reactivated lost track {} for returning object with appearance distance {:.4f}".format(
+                    best_track.track_id, best_dist
+                )
+            )
+            return best_track
+        return None
+
+    def _finalize_pending_tracks(self):
+        if not self.tracked_stracks:
+            return
+
+        replaced_tracks = []
+        tracks_to_add = []
+        for track in list(self.tracked_stracks):
+            if getattr(track, "pending", False) and track.ready_for_promotion(self.frame_id):
+                matched = self._match_pending_with_lost(track) if self.args.with_reid else None
+                if matched is not None:
+                    matched.re_activate(track, self.frame_id, new_id=False)
+                    matched.promote(reuse_id=matched.track_id)
+                    matched.score = track.score
+                    tracks_to_add.append(matched)
+                    replaced_tracks.append(track)
+                    if matched in self.lost_stracks:
+                        self.lost_stracks.remove(matched)
+                else:
+                    track.promote()
+                    logger.info(
+                        "Assigned new track id {} after waiting {} frames".format(
+                            track.track_id, self.activation_wait
+                        )
+                    )
+
+        if replaced_tracks:
+            for pending in replaced_tracks:
+                pending.mark_removed()
+            self.removed_stracks.extend(replaced_tracks)
+            self.tracked_stracks = [t for t in self.tracked_stracks if t not in replaced_tracks]
+            self.tracked_stracks.extend(tracks_to_add)
 
 def joint_stracks(tlista, tlistb):
     exists = {}

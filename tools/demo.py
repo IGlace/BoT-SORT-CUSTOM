@@ -45,6 +45,12 @@ def make_parser():
     parser.add_argument("--track_low_thresh", default=0.1, type=float, help="lowest detection threshold")
     parser.add_argument("--new_track_thresh", default=0.7, type=float, help="new track thresh")
     parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keep lost tracks")
+    parser.add_argument(
+        "--lost-track-buffer-seconds",
+        type=float,
+        default=300.0,
+        help="duration in seconds to keep lost tracks available for re-identification",
+    )
     parser.add_argument("--match_thresh", type=float, default=0.8, help="matching threshold for tracking")
     parser.add_argument("--aspect_ratio_thresh", type=float, default=1.6, help="threshold for filtering out boxes of which aspect ratio are above the given value.")
     parser.add_argument('--min_box_area', type=float, default=10, help='filter out tiny boxes')
@@ -59,6 +65,30 @@ def make_parser():
     parser.add_argument("--fast-reid-weights", dest="fast_reid_weights", default=r"pretrained/mot17_sbs_S50.pth", type=str,help="reid config file path")
     parser.add_argument('--proximity_thresh', type=float, default=0.5, help='threshold for rejecting low overlap reid matches')
     parser.add_argument('--appearance_thresh', type=float, default=0.25, help='threshold for rejecting low appearance similarity reid matches')
+    parser.add_argument(
+        "--activation-wait",
+        type=int,
+        default=30,
+        help="number of frames a new track must persist before assigning a permanent id",
+    )
+    parser.add_argument(
+        "--activation-feature-warmup",
+        type=int,
+        default=5,
+        help="number of frames before activation when appearance features should be collected",
+    )
+    parser.add_argument(
+        "--overlap-iou-thresh",
+        type=float,
+        default=0.5,
+        help="IoU threshold that triggers re-identification to prevent id switches",
+    )
+    parser.add_argument(
+        "--returning-track-match-thresh",
+        type=float,
+        default=0.25,
+        help="maximum cosine distance for matching pending tracks with lost tracks",
+    )
     return parser
 
 
