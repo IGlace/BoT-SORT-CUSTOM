@@ -1,0 +1,54 @@
+# Source configuration
+source:
+  type: "video"                     # video or camera
+  path: "assets/test16-215-275.mp4" # path to video file (for video type)
+  camera_id: 0                      # camera device ID (for camera type)
+
+# Display configuration
+display:
+  enabled: true            # Whether to show tracking visualization window
+
+# Output configuration
+output:
+  dir: "tracking_results"                # Directory to save tracking artefacts (defaults to experiment output when null)
+  save_video: true         # Persist rendered tracking video
+  save_txt: true           # Persist MOT-format text results
+
+# Model configuration
+model:
+  exp_file: "yolox/exps/example/mot/yolox_l_mix_det.py"  # experiment description file
+  ckpt: "pretrained/bytetrack_l_mot17.pth.tar"            # checkpoint for eval
+  device: "gpu"             # device to run model (cpu or gpu)
+  conf: null                # test confidence threshold (null uses experiment default)
+  nms: null                 # test NMS threshold (null uses experiment default)
+  tsize: null               # test image size (null uses experiment default)
+  fp16: true                # use FP16 for inference
+  fuse: true                # fuse conv and bn for testing
+  trt: false                # use TensorRT for inference
+
+# Tracking configuration
+tracker:
+  fps: 30                   # input frame rate
+  track_high_thresh: 0.6    # tracking confidence threshold
+  track_low_thresh: 0.1     # lowest detection threshold
+  new_track_thresh: 0.7     # new track threshold
+  track_buffer: 30          # frames to keep lost tracks
+  match_thresh: 0.8         # matching threshold for tracking
+  aspect_ratio_thresh: 1.6  # filter boxes with extreme aspect ratios
+  min_box_area: 10          # filter out tiny boxes
+  fuse_score: true          # fuse score and IoU for association
+
+# Camera Motion Compensation
+cmc:
+  method: "orb"             # cmc method: files (Vidstab GMC) | orb | ecc
+
+# ReID configuration
+reid:
+  enabled: true                                          # enable ReID
+  fast_reid_config: "fast_reid/configs/MOT17/sbs_S50.yml"  # reid config file path
+  fast_reid_weights: "pretrained/mot17_sbs_S50.pth"        # reid weights file path
+  proximity_thresh: 0.5                                  # reject low-overlap ReID matches
+  appearance_thresh: 0.25                                # reject low similarity ReID matches
+  reid_ambiguity_thresh: 0.05                            # ReID ambiguity threshold
+  reid_overlap_thresh: 0.7                               # ReID overlap threshold
+  reid_min_track_age: 4                                 # minimum track age for ReID activation
