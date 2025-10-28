@@ -74,6 +74,7 @@ def build_tracker_args(config, device):
         reid_ambiguity_thresh=reid_cfg.reid_ambiguity_thresh,
         reid_overlap_thresh=reid_cfg.reid_overlap_thresh,
         reid_min_track_age=reid_cfg.reid_min_track_age,
+        reid_early_collect_offset=reid_cfg.reid_early_collect_offset,
         cmc_method=cmc_cfg.method,
         name=tracker_name,
         ablation=False,

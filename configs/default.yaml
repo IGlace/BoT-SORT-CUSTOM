@@ -49,6 +49,7 @@ reid:
   fast_reid_weights: "pretrained/mot17_sbs_S50.pth"        # reid weights file path
   proximity_thresh: 0.5                                  # reject low-overlap ReID matches
   appearance_thresh: 0.25                                # reject low similarity ReID matches
-  reid_ambiguity_thresh: 0.05                            # ReID ambiguity threshold
-  reid_overlap_thresh: 0.7                               # ReID overlap threshold
-  reid_min_track_age: 4                                 # minimum track age for ReID activation
+  reid_ambiguity_thresh: 0.01                            # tighten gap before triggering ReID
+  reid_overlap_thresh: 0.0                               # trigger ReID as soon as boxes touch
+  reid_min_track_age: 15                                 # minimum track age for ReID activation
+  reid_early_collect_offset: 5                          # start collecting ReID features N frames before min_track_age

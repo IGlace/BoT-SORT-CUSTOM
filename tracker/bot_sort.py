@@ -245,6 +245,7 @@ class BoTSORT(object):
         self.reid_ambiguity_thresh = getattr(args, 'reid_ambiguity_thresh', 0.05)
         self.reid_overlap_thresh = getattr(args, 'reid_overlap_thresh', 0.7)
         self.reid_min_track_age = getattr(args, 'reid_min_track_age', 4)
+        self.reid_early_collect_offset = getattr(args, 'reid_early_collect_offset', 5)
         self.total_reid_frames = 0
         self.total_reid_calls = 0
         self._reid_used_this_frame = False
@@ -749,8 +750,11 @@ class BoTSORT(object):
         return emb_dists
 
     def _track_ready_for_init(self, track):
-        track_age = (track.frame_id - track.start_frame + 1) if track.start_frame is not None else 0
-        return track_age >= self.reid_min_track_age and track.smooth_feat is None
+        if track.start_frame is None:
+            return False
+        track_age = (track.frame_id - track.start_frame + 1)
+        early_collection_age = max(0, self.reid_min_track_age - self.reid_early_collect_offset)
+        return track_age >= early_collection_age and track.smooth_feat is None
 
     def _process_pending_initial_features(self, img, pending_features, frame_id):
         if not pending_features or self.encoder is None:
