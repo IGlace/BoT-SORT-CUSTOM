@@ -46,9 +46,7 @@ def build_tracker_args(config, device):
     fuse_score = bool(tracker_cfg.fuse_score)
     with_reid = bool(reid_cfg.enabled)
 
-    run_name = config.run_name if hasattr(config, "run_name") else None
-    experiment_name = config.experiment_name if hasattr(config, "experiment_name") else None
-    tracker_name = run_name or experiment_name
+    tracker_name = "personal_tracker"  # Simple default name
 
     if isinstance(device, torch.device):
         device_type = device.type
@@ -75,6 +73,13 @@ def build_tracker_args(config, device):
         reid_overlap_thresh=reid_cfg.reid_overlap_thresh,
         reid_min_track_age=reid_cfg.reid_min_track_age,
         reid_early_collect_offset=reid_cfg.reid_early_collect_offset,
+        # Persistent ReID parameters
+        persistent_max_age_minutes=reid_cfg.persistent_max_age_minutes,
+        persistent_max_identities=reid_cfg.persistent_max_identities,
+        persistent_similarity_threshold=reid_cfg.persistent_similarity_threshold,
+        # Safety monitoring parameters
+        high_density_threshold=tracker_cfg.high_density_threshold,
+        safety_monitoring=tracker_cfg.safety_monitoring,
         cmc_method=cmc_cfg.method,
         name=tracker_name,
         ablation=False,
@@ -281,15 +286,8 @@ def main(config_path):
     exp = get_exp(config.model.exp_file, model_name)
 
     output_cfg = config.output
-    experiment_name = None
-    if hasattr(config, "experiment_name") and config.experiment_name:
-        experiment_name = config.experiment_name
-    elif hasattr(config, "run_name") and config.run_name:
-        experiment_name = config.run_name
-    else:
-        experiment_name = exp.exp_name
-    output_override = output_cfg.dir
-    output_dir = output_override if output_override else osp.join(exp.output_dir, experiment_name)
+    experiment_name = exp.exp_name
+    output_dir = output_cfg.dir if output_cfg.dir else osp.join(exp.output_dir, experiment_name)
     os.makedirs(output_dir, exist_ok=True)
 
     if config.model.trt:
@@ -388,5 +386,9 @@ if __name__ == "__main__":
 
     if not args.config:
         args.config = "./configs/default.yaml"
+    
+    # Configure logger to show INFO level messages (required for safety monitoring visibility)
+    logger.remove()
+    logger.add(sys.stderr, level="INFO", format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>")
     
     main(args.config)

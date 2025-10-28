@@ -19,37 +19,47 @@ model:
   exp_file: "yolox/exps/example/mot/yolox_l_mix_det.py"  # experiment description file
   ckpt: "pretrained/bytetrack_l_mot17.pth.tar"            # checkpoint for eval
   device: "gpu"             # device to run model (cpu or gpu)
+  name: "yolox-l"       # YOLOX-large for better accuracy in personal spaces
+  fp16: true           # Mixed precision for speed
+  fuse: true           # Fuse conv and bn for optimization
   conf: null                # test confidence threshold (null uses experiment default)
   nms: null                 # test NMS threshold (null uses experiment default)
   tsize: null               # test image size (null uses experiment default)
-  fp16: true                # use FP16 for inference
-  fuse: true                # fuse conv and bn for testing
   trt: false                # use TensorRT for inference
 
-# Tracking configuration
+# Personal Space Tracking Configuration (Optimized for accuracy)
 tracker:
-  fps: 30                   # input frame rate
-  track_high_thresh: 0.6    # tracking confidence threshold
-  track_low_thresh: 0.1     # lowest detection threshold
-  new_track_thresh: 0.7     # new track threshold
-  track_buffer: 30          # frames to keep lost tracks
-  match_thresh: 0.8         # matching threshold for tracking
-  aspect_ratio_thresh: 1.6  # filter boxes with extreme aspect ratios
-  min_box_area: 10          # filter out tiny boxes
-  fuse_score: true          # fuse score and IoU for association
+  fps: 30                   # Standard frame rate
+  track_high_thresh: 0.4    # Lower threshold to catch all people (critical for safety)
+  track_low_thresh: 0.05    # Very low to ensure no missed detections
+  new_track_thresh: 0.8     # Higher threshold for new tracks (prevent fragmentation)
+  track_buffer: 120         # 4 minutes at 30fps - longer for elderly care scenarios
+  match_thresh: 0.6         # Balanced for personal spaces (not too strict, not too loose)
+  aspect_ratio_thresh: 2.0  # More lenient for various poses (sitting, lying down)
+  min_box_area: 15          # Small enough for distant people in large rooms
+  fuse_score: true          # Fuse score and IoU for better association
+  # Safety monitoring for reliable tracking
+  high_density_threshold: 5        # Lower threshold for homes/offices (5+ people = crowded)
+  safety_monitoring: true          # Enable safety monitoring and emergency responses
 
 # Camera Motion Compensation
 cmc:
-  method: "orb"             # cmc method: files (Vidstab GMC) | orb | ecc
+  method: "orb"             # Good for indoor camera movement
 
 # ReID configuration
 reid:
-  enabled: true                                          # enable ReID
-  fast_reid_config: "fast_reid/configs/MOT17/sbs_S50.yml"  # reid config file path
-  fast_reid_weights: "pretrained/mot17_sbs_S50.pth"        # reid weights file path
-  proximity_thresh: 0.5                                  # reject low-overlap ReID matches
-  appearance_thresh: 0.25                                # reject low similarity ReID matches
-  reid_ambiguity_thresh: 0.01                            # tighten gap before triggering ReID
-  reid_overlap_thresh: 0.0                               # trigger ReID as soon as boxes touch
-  reid_min_track_age: 15                                 # minimum track age for ReID activation
-  reid_early_collect_offset: 5                          # start collecting ReID features N frames before min_track_age
+  enabled: true                                          # Enable ReID for accurate person tracking
+  fast_reid_config: "fast_reid/configs/MOT17/sbs_S50.yml"  # ReID config file path
+  fast_reid_weights: "pretrained/mot17_sbs_S50.pth"        # ReID weights file path
+  # Appearance matching thresholds (optimized for personal spaces)
+  proximity_thresh: 0.3                # Lower IoU requirement (people may be far in large rooms)
+  appearance_thresh: 0.3               # Stricter appearance matching (prevent ID switches)
+  # ReID triggering (more aggressive for safety)
+  reid_ambiguity_thresh: 0.02          # Lower = catch more ambiguous situations
+  reid_overlap_thresh: 0.1             # Trigger ReID on slight overlaps (critical for safety)
+  reid_min_track_age: 5                # Start ReID quickly (5 frames) for faster stabilization
+  reid_early_collect_offset: 2         # Start collecting features even earlier
+  # Persistent ReID for long-term person memory
+  persistent_max_age_minutes: 1440     # 24 hours - remember people across sessions
+  persistent_max_identities: 50        # Personal spaces typically have fewer unique people
+  persistent_similarity_threshold: 0.25  # Strict matching for critical applications
