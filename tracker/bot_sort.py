@@ -302,9 +302,33 @@ class BoTSORT(object):
             classes_keep = []
 
         if len(dets) > 0:
+            '''Filter small detections that cause confusion'''
+            # Convert tlbr to width and height for filtering
+            detection_heights = dets[:, 3] - dets[:, 1]  # y2 - y1
+            detection_widths = dets[:, 2] - dets[:, 0]   # x2 - x1
+            
+            # Count detections before filtering
+            detections_before = len(dets)
+            
+            # Filter out detections that are too small
+            size_mask = (detection_heights >= self.args.min_detection_height) & \
+                       (detection_widths >= self.args.min_detection_width)
+            
+            dets = dets[size_mask]
+            scores_keep = scores_keep[size_mask]
+            classes_keep = classes_keep[size_mask]
+            
+            # Log filtering results
+            detections_filtered = detections_before - len(dets)
+            if detections_filtered > 0:
+                logger.info(f"Frame {self.frame_id}: Filtered {detections_filtered} small detections (< {self.args.min_detection_height}x{self.args.min_detection_width}px)")
+            
             '''Detections'''
-            detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                          (tlbr, s) in zip(dets, scores_keep)]
+            if len(dets) > 0:
+                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
+                              (tlbr, s) in zip(dets, scores_keep)]
+            else:
+                detections = []
         else:
             detections = []
 

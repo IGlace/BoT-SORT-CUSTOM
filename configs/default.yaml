@@ -41,6 +41,9 @@ tracker:
   # Safety monitoring for reliable tracking
   high_density_threshold: 5        # Lower threshold for homes/offices (5+ people = crowded)
   safety_monitoring: true          # Enable safety monitoring and emergency responses
+  # Small detection filtering
+  min_detection_height: 30         # Ignore detections smaller than 30 pixels height
+  min_detection_width: 20          # Ignore detections smaller than 20 pixels width
 
 # Camera Motion Compensation
 cmc:

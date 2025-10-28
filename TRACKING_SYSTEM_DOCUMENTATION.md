@@ -65,6 +65,10 @@ tracker:
   # Safety Monitoring
   high_density_threshold: 5  # Person count for crowded scene detection
   safety_monitoring: true    # Enable real-time safety monitoring
+  
+  # Small Detection Filtering
+  min_detection_height: 30   # Ignore detections smaller than 30px height
+  min_detection_width: 20    # Ignore detections smaller than 20px width
 ```
 
 ### **ReID Configuration**
@@ -184,6 +188,41 @@ Long-term person identity management:
 
 #### **Implementation Location**: `tracker/persistent_reid.py`
 
+### **6. Small Detection Filtering**
+Pre-processing filter to eliminate confusing small detections:
+
+#### **Purpose**:
+- Ignores detections that are too small to be reliable people
+- Prevents confusion from small, noisy detections  
+- Avoids wasting ReID and Kalman filter resources on unreliable detections
+- Reduces false track creation and ID switches
+
+#### **Configuration Parameters**:
+```yaml
+tracker:
+  min_detection_height: 30    # Ignore detections smaller than 30px height
+  min_detection_width: 20     # Ignore detections smaller than 20px width
+```
+
+#### **Implementation Process**:
+1. **Pre-filtering**: Applied before creating STrack objects
+2. **Size calculation**: Converts tlbr format to width/height
+3. **Mask filtering**: Uses boolean mask to filter small detections
+4. **Early elimination**: Small detections never enter tracking pipeline
+
+#### **Benefits**:
+- **Cleaner tracking**: Reduces false tracks from unreliable detections
+- **Better ReID accuracy**: Less confusing features in persistent database
+- **Resource efficiency**: Kalman filter and ReID not wasted on noisy detections
+- **Improved stability**: Prevents ID switches caused by small, unstable detections
+
+#### **Implementation Location**: `tracker/bot_sort.py` (lines 304-333)
+
+#### **Expected Output**:
+```
+Frame 123: Filtered 3 small detections (< 30x20px)
+```
+
 ---
 
 ## 📁 File Structure & Integration
@@ -277,7 +316,20 @@ reid:
   reid_ambiguity_thresh: 0.05      # Less sensitive
 ```
 
-#### **Experiment 3: Memory Duration**
+#### **Experiment 6: Small Detection Filtering**
+```yaml
+# Strict filtering (clean environments)
+tracker:
+  min_detection_height: 40   # Filter very small detections
+  min_detection_width: 25    # Strict width requirement
+  
+# Lenient filtering (distant views)
+tracker:
+  min_detection_height: 20   # Allow smaller people
+  min_detection_width: 15    # More permissive width
+```
+
+#### **Experiment 7: Memory Duration**
 ```yaml
 # Short-term memory (session-based)
 reid:
@@ -387,6 +439,8 @@ reid:
 2. **High Fragmentation**: Increase track buffer
 3. **High ReID Usage**: Check reid_ambiguity_thresh
 4. **High ID Switches**: Verify appearance_thresh
+5. **Missing Distant People**: Reduce min_detection_height/width
+6. **Too Many Small Tracks**: Increase min_detection_height/width
 
 ---
 

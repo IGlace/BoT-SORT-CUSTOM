@@ -64,6 +64,9 @@ def build_tracker_args(config, device):
         aspect_ratio_thresh=tracker_cfg.aspect_ratio_thresh,
         min_box_area=tracker_cfg.min_box_area,
         fuse_score=fuse_score,
+        # Small detection filtering
+        min_detection_height=tracker_cfg.min_detection_height,
+        min_detection_width=tracker_cfg.min_detection_width,
         proximity_thresh=reid_cfg.proximity_thresh,
         appearance_thresh=reid_cfg.appearance_thresh,
         with_reid=with_reid,
